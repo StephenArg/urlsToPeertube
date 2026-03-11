@@ -311,6 +311,12 @@ def iter_urls(path: Path) -> Iterable[str]:
         yield s
 
 
+def append_failed_url(path: Path, url: str) -> None:
+    """Append a failed URL to the given file."""
+    with path.open("a", encoding="utf-8") as f:
+        f.write(url.rstrip() + "\n")
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(
         prog="peertube_import.py",
@@ -321,6 +327,11 @@ def main(argv: list[str]) -> int:
         "--urls",
         default=str(SCRIPT_DIR / "urls.txt"),
         help="Path to urls.txt (one URL per line). Default: ./urls.txt next to the script.",
+    )
+    ap.add_argument(
+        "--failed-urls",
+        default=str(SCRIPT_DIR / "failed_urls.txt"),
+        help="Path to append failed URLs (one per line). Default: ./failed_urls.txt next to the script.",
     )
     ap.add_argument(
         "--env",
@@ -402,10 +413,12 @@ def main(argv: list[str]) -> int:
         print(f"URLs file not found: {urls_path}", file=sys.stderr)
         return 2
 
+    failed_urls_path = Path(args.failed_urls).expanduser()
+
     if cfg.verbose:
         print(f"[config] instance={cfg.instance}")
         print(f"[config] user={cfg.username} channel_id={cfg.channel_id} privacy={cfg.privacy} language={cfg.language}")
-        print(f"[config] urls={urls_path} env={env_path}")
+        print(f"[config] urls={urls_path} failed_urls={failed_urls_path} env={env_path}")
         print(f"[config] yt-dlp={'on' if cfg.use_yt_dlp else 'off'} tls_verify={'on' if cfg.verify_tls else 'off'}")
 
     urls = list(iter_urls(urls_path))
@@ -446,12 +459,14 @@ def main(argv: list[str]) -> int:
                 )
             except Exception as e:
                 print(f"[fatal] {url} -> {e}", file=sys.stderr)
+                append_failed_url(failed_urls_path, url)
                 return 1
 
             if success:
                 ok += 1
             else:
                 failed += 1
+                append_failed_url(failed_urls_path, url)
 
             if i < len(urls) and cfg.sleep_seconds > 0:
                 time.sleep(cfg.sleep_seconds)
