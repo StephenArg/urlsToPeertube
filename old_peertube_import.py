@@ -6,21 +6,14 @@
 # ]
 # ///
 """
-Import URLs into PeerTube using the REST API, one URL per interval, with resume support.
+Bulk-import (YouTube/HTTP/etc.) URLs into PeerTube using the REST API.
 
-Behavior:
-- reads URLs from ./urls.txt (same directory as this script)
+Defaults:
+- reads urls from ./urls.txt (same directory as this script)
 - reads config from ./.env (same directory as this script)
-- persists the last processed URL to ./last_ran_url.txt by default
-- on startup (and each loop), resumes from the URL after the one stored in last_ran_url.txt
-- processes at most one URL per loop, then sleeps for the configured interval
-- if all URLs are already processed, stays alive and checks again after the interval
 
 Run with uv:
   uv run peertube_import.py
-
-Typical PM2 usage:
-  pm2 start peertube_import.py --interpreter python3
 """
 
 from __future__ import annotations
@@ -98,7 +91,7 @@ class Config:
     channel_id: int
     privacy: int
     language: str
-    interval_seconds: float
+    sleep_seconds: float
     timeout_seconds: float
     verify_tls: bool
     use_yt_dlp: bool
@@ -164,7 +157,7 @@ def build_client(cfg: Config) -> httpx.Client:
         verify=cfg.verify_tls,
         headers={
             "Accept": "application/json",
-            "User-Agent": "peertube-bulk-import/1.1-hourly-resume",
+            "User-Agent": "peertube-bulk-import/1.0",
         },
         follow_redirects=True,
     )
@@ -324,110 +317,10 @@ def append_failed_url(path: Path, url: str) -> None:
         f.write(url.rstrip() + "\n")
 
 
-def read_last_ran_url(path: Path) -> Optional[str]:
-    if not path.exists():
-        return None
-    value = path.read_text(encoding="utf-8").strip()
-    return value or None
-
-
-def write_last_ran_url(path: Path, url: str) -> None:
-    path.write_text(url.rstrip() + "\n", encoding="utf-8")
-
-
-def find_next_url(urls: list[str], last_ran_url: Optional[str]) -> Optional[str]:
-    """
-    Return the URL that comes after last_ran_url.
-    If there is no state yet, return the first URL.
-    If the saved URL is not found, restart from the top.
-    If the saved URL is the final URL, return None.
-    """
-    if not urls:
-        return None
-    if not last_ran_url:
-        return urls[0]
-
-    for idx, url in enumerate(urls):
-        if url == last_ran_url:
-            next_idx = idx + 1
-            return urls[next_idx] if next_idx < len(urls) else None
-
-    return urls[0]
-
-
-def sleep_with_message(seconds: float, *, verbose: bool) -> None:
-    if verbose:
-        print(f"[sleep] sleeping {seconds:.0f}s before the next check")
-    time.sleep(seconds)
-
-
-def process_one_url(
-    cfg: Config,
-    *,
-    urls_path: Path,
-    failed_urls_path: Path,
-    state_path: Path,
-) -> Tuple[bool, bool]:
-    """
-    Returns:
-      (did_process_url, success)
-    """
-    urls = list(iter_urls(urls_path))
-    if not urls:
-        print(f"[idle] no URLs found in {urls_path}", file=sys.stderr)
-        return False, True
-
-    last_ran_url = read_last_ran_url(state_path)
-    next_url = find_next_url(urls, last_ran_url)
-
-    if cfg.verbose and last_ran_url:
-        print(f"[resume] last ran URL: {last_ran_url}")
-
-    if last_ran_url and next_url == urls[0] and last_ran_url not in urls and cfg.verbose:
-        print(f"[resume] saved URL not found in {urls_path}; restarting from the top")
-
-    if next_url is None:
-        if cfg.verbose:
-            print("[idle] all URLs in urls.txt have already been processed; waiting for new URLs")
-        return False, True
-
-    if cfg.verbose:
-        print(f"[next] importing {next_url}")
-
-    title = ""
-    if cfg.use_yt_dlp:
-        title = maybe_title_from_yt_dlp(next_url)
-
-    with build_client(cfg) as client:
-        token = get_access_token(client, username=cfg.username, password=cfg.password)
-        success = import_url(
-            client,
-            token=token,
-            channel_id=cfg.channel_id,
-            privacy=cfg.privacy,
-            language=cfg.language,
-            url=next_url,
-            title=title,
-            dry_run=cfg.dry_run,
-            verbose=cfg.verbose,
-            fail_fast=cfg.fail_fast,
-        )
-
-    # Persist the URL that was just attempted so restarts continue after it.
-    # Keep this disabled in dry-run mode so tests do not advance the queue.
-    if not cfg.dry_run:
-        write_last_ran_url(state_path, next_url)
-
-    if not success:
-        append_failed_url(failed_urls_path, next_url)
-
-    return True, success
-
-
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(
         prog="peertube_import.py",
-        description="Import one URL per interval into a PeerTube channel, with resume support.",
+        description="Bulk import URLs into a PeerTube channel using the PeerTube REST API.",
     )
 
     ap.add_argument(
@@ -441,11 +334,6 @@ def main(argv: list[str]) -> int:
         help="Path to append failed URLs (one per line). Default: ./failed_urls.txt next to the script.",
     )
     ap.add_argument(
-        "--state-file",
-        default=str(SCRIPT_DIR / "last_ran_url.txt"),
-        help="Path to the file that stores the last processed URL. Default: ./last_ran_url.txt next to the script.",
-    )
-    ap.add_argument(
         "--env",
         default=str(SCRIPT_DIR / ".env"),
         help="Path to .env file. Default: ./.env next to the script.",
@@ -455,12 +343,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--privacy", type=int, default=None, help="Override privacy (1..5) for this run.")
     ap.add_argument("--language", type=str, default=None, help="Override language for this run (e.g. en, it).")
 
-    ap.add_argument(
-        "--sleep",
-        type=float,
-        default=None,
-        help="Seconds between import attempts/checks. Default from env or 3600 (1 hour).",
-    )
+    ap.add_argument("--sleep", type=float, default=None, help="Seconds to sleep between imports (default from env or 1).")
     ap.add_argument("--timeout", type=float, default=None, help="HTTP timeout in seconds (default from env or 30).")
     ap.add_argument(
         "--insecure",
@@ -487,7 +370,7 @@ def main(argv: list[str]) -> int:
     channel_id_s = getenv_prefer_runtime("PEERTUBE_CHANNEL_ID", dotenv)
     privacy_s = getenv_prefer_runtime("PEERTUBE_PRIVACY", dotenv, "1")
     language = getenv_prefer_runtime("PEERTUBE_LANGUAGE", dotenv, "en")
-    interval_s = getenv_prefer_runtime("PEERTUBE_SLEEP", dotenv, "3600")
+    sleep_s = getenv_prefer_runtime("PEERTUBE_SLEEP", dotenv, "3")
     timeout_s = getenv_prefer_runtime("PEERTUBE_TIMEOUT", dotenv, "30")
 
     missing = [k for k, v in {
@@ -513,7 +396,7 @@ def main(argv: list[str]) -> int:
             channel_id=int(args.channel_id if args.channel_id is not None else int(str(channel_id_s))),
             privacy=int(args.privacy if args.privacy is not None else int(str(privacy_s))),
             language=str(args.language if args.language is not None else str(language)),
-            interval_seconds=float(args.sleep if args.sleep is not None else float(str(interval_s))),
+            sleep_seconds=float(args.sleep if args.sleep is not None else float(str(sleep_s))),
             timeout_seconds=float(args.timeout if args.timeout is not None else float(str(timeout_s))),
             verify_tls=not bool(args.insecure),
             use_yt_dlp=not bool(args.no_yt_dlp),
@@ -531,42 +414,65 @@ def main(argv: list[str]) -> int:
         return 2
 
     failed_urls_path = Path(args.failed_urls).expanduser()
-    state_path = Path(args.state_file).expanduser()
 
     if cfg.verbose:
         print(f"[config] instance={cfg.instance}")
         print(f"[config] user={cfg.username} channel_id={cfg.channel_id} privacy={cfg.privacy} language={cfg.language}")
-        print(f"[config] urls={urls_path} failed_urls={failed_urls_path} state_file={state_path} env={env_path}")
+        print(f"[config] urls={urls_path} failed_urls={failed_urls_path} env={env_path}")
         print(f"[config] yt-dlp={'on' if cfg.use_yt_dlp else 'off'} tls_verify={'on' if cfg.verify_tls else 'off'}")
-        print(f"[config] interval_seconds={cfg.interval_seconds}")
+
+    urls = list(iter_urls(urls_path))
+    if not urls:
+        print("No URLs found in urls file (empty or only comments).", file=sys.stderr)
+        return 0
 
     ok = 0
     failed = 0
 
-    try:
-        while True:
-            try:
-                did_process, success = process_one_url(
-                    cfg,
-                    urls_path=urls_path,
-                    failed_urls_path=failed_urls_path,
-                    state_path=state_path,
-                )
-                if did_process:
-                    if success:
-                        ok += 1
-                    else:
-                        failed += 1
-            except Exception as e:
-                print(f"[fatal] loop error -> {e}", file=sys.stderr)
-                if cfg.fail_fast:
-                    return 1
+    with build_client(cfg) as client:
+        try:
+            token = get_access_token(client, username=cfg.username, password=cfg.password)
+        except Exception as e:
+            print(f"Failed to authenticate: {e}", file=sys.stderr)
+            return 1
 
-            sleep_with_message(cfg.interval_seconds, verbose=cfg.verbose)
-    except KeyboardInterrupt:
-        print("\nStopped by user.")
-        print(f"Session totals: OK={ok} Failed={failed}")
-        return 0
+        for i, url in enumerate(urls, start=1):
+            if cfg.verbose:
+                print(f"[{i}/{len(urls)}] importing {url}")
+
+            title = ""
+            if cfg.use_yt_dlp:
+                title = maybe_title_from_yt_dlp(url)
+
+            try:
+                success = import_url(
+                    client,
+                    token=token,
+                    channel_id=cfg.channel_id,
+                    privacy=cfg.privacy,
+                    language=cfg.language,
+                    url=url,
+                    title=title,
+                    dry_run=cfg.dry_run,
+                    verbose=cfg.verbose,
+                    fail_fast=cfg.fail_fast,
+                )
+            except Exception as e:
+                print(f"[fatal] {url} -> {e}", file=sys.stderr)
+                append_failed_url(failed_urls_path, url)
+                return 1
+
+            if success:
+                ok += 1
+            else:
+                failed += 1
+                append_failed_url(failed_urls_path, url)
+
+            if i < len(urls) and cfg.sleep_seconds > 0:
+                time.sleep(cfg.sleep_seconds)
+
+    print(f"Done. OK={ok} Failed={failed}")
+    return 0 if failed == 0 else 1
 
 
 if __name__ == "__main__":
