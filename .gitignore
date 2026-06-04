@@ -1,1 +1,3 @@
 .env
+failed_imports_cache.json
+oldListOfLikedVideos.txt
